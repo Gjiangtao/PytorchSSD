@@ -13,12 +13,15 @@ import torch.optim as optim
 import torch.utils.data as data
 from torch.autograd import Variable
 
+
 from data import VOCroot, COCOroot, VOC_300, VOC_512, COCO_300, COCO_512, COCO_mobile_300, AnnotationTransform, \
     COCODetection, VOCDetection, detection_collate, BaseTransform, preproc
 from layers.functions import Detect, PriorBox
 from layers.modules import MultiBoxLoss
 from utils.nms_wrapper import nms
 from utils.timer import Timer
+from tensorboardX import SummaryWriter
+
 
 
 def str2bool(v):
@@ -29,15 +32,15 @@ parser = argparse.ArgumentParser(
     description='Receptive Field Block Net Training')
 parser.add_argument('-v', '--version', default='SSD_vgg',
                     help='RFB_vgg ,RFB_E_vgg RFB_mobile SSD_vgg version.')
-parser.add_argument('-s', '--size', default='512',
+parser.add_argument('-s', '--size', default='300',
                     help='300 or 512 input size.')
-parser.add_argument('-d', '--dataset', default='COCO',
+parser.add_argument('-d', '--dataset', default='VOC',
                     help='VOC or COCO dataset')
 parser.add_argument(
     '--basenet', default='weights/vgg16_reducedfc.pth', help='pretrained base model')
 parser.add_argument('--jaccard_threshold', default=0.5,
                     type=float, help='Min Jaccard index for matching')
-parser.add_argument('-b', '--batch_size', default=8,
+parser.add_argument('-b', '--batch_size', default=4,
                     type=int, help='Batch size for training')
 parser.add_argument('--num_workers', default=4,
                     type=int, help='Number of workers used in dataloading')
@@ -56,7 +59,7 @@ parser.add_argument('-max', '--max_epoch', default=300,
                     type=int, help='max epoch for retraining')
 parser.add_argument('--weight_decay', default=5e-4,
                     type=float, help='Weight decay for SGD')
-parser.add_argument('-we', '--warm_epoch', default=1,
+parser.add_argument('-we', '--warm_epoch', default=6,
                     type=int, help='max epoch for retraining')
 parser.add_argument('--gamma', default=0.1,
                     type=float, help='Gamma update for SGD')
@@ -74,14 +77,20 @@ parser.add_argument('--send_images_to_visdom', type=str2bool, default=False,
                     help='Sample a random image from each 10th batch, send it to visdom after augmentations step')
 args = parser.parse_args()
 
+print(args)
+
 save_folder = os.path.join(args.save_folder, args.version + '_' + args.size, args.date)
 if not os.path.exists(save_folder):
     os.makedirs(save_folder)
 test_save_dir = os.path.join(save_folder, 'ss_predict')
 if not os.path.exists(test_save_dir):
     os.makedirs(test_save_dir)
+tensorboard_save_dir = os.path.join(save_folder, 'runs')
+if not os.path.exists(tensorboard_save_dir):
+    os.makedirs(tensorboard_save_dir)
 
-log_file_path = save_folder + '/train' + time.strftime('_%Y-%m-%d-%H-%M', time.localtime(time.time())) + '.log'
+log_file_path = save_folder + '/train_log' + '.txt'
+
 if args.dataset == 'VOC':
     train_sets = [('2007', 'trainval'), ('2012', 'trainval')]
     cfg = (VOC_300, VOC_512)[args.size == '512']
@@ -194,7 +203,7 @@ optimizer = optim.SGD(net.parameters(), lr=args.lr,
 
 criterion = MultiBoxLoss(num_classes, 0.5, True, 0, True, 3, 0.5, False)
 priorbox = PriorBox(cfg)
-priors = Variable(priorbox.forward(), volatile=True)
+priors = priorbox.forward()
 # dataset
 print('Loading Dataset...')
 if args.dataset == 'VOC':
@@ -254,10 +263,12 @@ def train():
     else:
         start_iter = 0
 
-    log_file = open(log_file_path, 'w')
     batch_iterator = None
     mean_loss_c = 0
     mean_loss_l = 0
+
+    writer = SummaryWriter(log_dir=tensorboard_save_dir, comment=args.version + '_' + args.size)
+
     for iteration in range(start_iter, max_iter + 10):
         if (iteration % epoch_size == 0):
             # create batch iterator
@@ -269,17 +280,27 @@ def train():
             if epoch % args.save_frequency == 0 and epoch > 0:
                 torch.save(net.state_dict(), os.path.join(save_folder, args.version + '_' + args.dataset + '_epoches_' +
                                                           repr(epoch) + '.pth'))
-            if epoch % args.test_frequency == 0 and epoch > 0:
+            if epoch % int(args.test_frequency) == 0 and epoch > 0:
                 net.eval()
                 top_k = (300, 200)[args.dataset == 'COCO']
                 if args.dataset == 'VOC':
-                    APs, mAP = test_net(test_save_dir, net, detector, args.cuda, testset,
+                    if args.ngpu > 1:
+                        APs, mAP = test_net(test_save_dir, net, detector, args.cuda, testset,
                                         BaseTransform(net.module.size, rgb_means, rgb_std, (2, 0, 1)),
                                         top_k, thresh=0.01)
+                    else:
+                        APs, mAP = test_net(test_save_dir, net, detector, args.cuda, testset,
+                                            BaseTransform(net.size, rgb_means, rgb_std, (2, 0, 1)),
+                                            top_k, thresh=0.01)
+                    writer.add_scalar('mAP', mAP, iteration)
+
                     APs = [str(num) for num in APs]
                     mAP = str(mAP)
-                    log_file.write(str(iteration) + ' APs:\n' + '\n'.join(APs))
-                    log_file.write('mAP:\n' + mAP + '\n')
+
+                    with open(log_file_path, 'a+') as fo:
+                        fo.write(str(iteration) + ' APs:\n' + '\n'.join(APs))
+                        fo.write('mAP:\n' + mAP + '\n')
+
                 else:
                     test_net(test_save_dir, net, detector, args.cuda, testset,
                              BaseTransform(net.module.size, rgb_means, rgb_std, (2, 0, 1)),
@@ -299,7 +320,9 @@ def train():
                     win=epoch_lot,
                     update='append'
                 )
+
         lr = adjust_learning_rate(optimizer, args.gamma, epoch, step_index, iteration, epoch_size)
+        writer.add_scalar('Train/lr', lr, epoch)
 
         # load train data
         images, targets = next(batch_iterator)
@@ -308,44 +331,56 @@ def train():
 
         if args.cuda:
             images = Variable(images.cuda())
-            targets = [Variable(anno.cuda(), volatile=True) for anno in targets]
+            targets = [Variable(anno.cuda()) for anno in targets]
+            scales = Variable(scales.cuda())
         else:
             images = Variable(images)
-            targets = [Variable(anno, volatile=True) for anno in targets]
+            targets = [Variable(anno) for anno in targets]
+            scales = Variable(scales)
+
         # forward
         out = net(images)
         # backprop
         optimizer.zero_grad()
         # arm branch loss
+
         loss_l, loss_c = criterion(out, priors, targets)
         # odm branch loss
 
-        mean_loss_c += loss_c.data[0]
-        mean_loss_l += loss_l.data[0]
-
         loss = loss_l + loss_c
+
         loss.backward()
         optimizer.step()
+
+        mean_loss_c += loss_c.item()
+        mean_loss_l += loss_l.item()
+
         load_t1 = time.time()
         if iteration % 10 == 0:
             print('Epoch:' + repr(epoch) + ' || epochiter: ' + repr(iteration % epoch_size) + '/' + repr(epoch_size)
                   + '|| Totel iter ' +
                   repr(iteration) + ' || L: %.4f C: %.4f||' % (
-                      mean_loss_l / 10, mean_loss_c / 10) +
+                      loss_l.item(), loss_c.item()) +
                   'Batch time: %.4f sec. ||' % (load_t1 - load_t0) + 'LR: %.8f' % (lr))
-            log_file.write(
-                'Epoch:' + repr(epoch) + ' || epochiter: ' + repr(iteration % epoch_size) + '/' + repr(epoch_size)
-                + '|| Totel iter ' +
-                repr(iteration) + ' || L: %.4f C: %.4f||' % (
-                    mean_loss_l / 10, mean_loss_c / 10) +
-                'Batch time: %.4f sec. ||' % (load_t1 - load_t0) + 'LR: %.8f' % (lr) + '\n')
+            with open(log_file_path, 'a+') as fo:
+                fo.write(
+                    'Epoch:' + repr(epoch) + ' || epochiter: ' + repr(iteration % epoch_size) + '/' + repr(epoch_size)
+                    + '|| Totel iter ' +
+                    repr(iteration) + ' || L: %.4f C: %.4f||' % (
+                        mean_loss_l / 10, mean_loss_c / 10) +
+                    'Batch time: %.4f sec. ||' % (load_t1 - load_t0) + 'LR: %.8f' % (lr) + '\n')
+
+            writer.add_scalar('Train/L-loss', mean_loss_l / 10, iteration)
+            writer.add_scalar('Train/C-loss', mean_loss_c / 10, iteration)
+            writer.add_scalar('Train/All-loss', mean_loss_l / 10 + mean_loss_c / 10, iteration)
 
             mean_loss_c = 0
             mean_loss_l = 0
             if args.visdom and args.send_images_to_visdom:
                 random_batch_index = np.random.randint(images.size(0))
                 viz.image(images.data[random_batch_index].cpu().numpy())
-    log_file.close()
+
+    writer.close()
     torch.save(net.state_dict(), os.path.join(save_folder,
                                               'Final_' + args.version + '_' + args.dataset + '.pth'))
 
@@ -385,7 +420,7 @@ def test_net(save_folder, net, detector, cuda, testset, transform, max_per_image
 
     for i in range(num_images):
         img = testset.pull_image(i)
-        x = Variable(transform(img).unsqueeze(0), volatile=True)
+        x = Variable(transform(img).unsqueeze(0))
         if cuda:
             x = x.cuda()
 
